@@ -7,6 +7,12 @@ import (
 	"sync"
 )
 
+var (
+	_ Service        = &UnimplementedHandler{}
+	_ Namespace      = &namespace{}
+	_ sort.Interface = &unitSorter{}
+)
+
 type (
 	ServiceType int32
 	Restart     int32
@@ -91,21 +97,28 @@ const (
 func (h UnimplementedHandler) mustEmbedUnimplemented() {}
 func (h UnimplementedHandler) Name() string            { return "unimplemented" }
 func (h UnimplementedHandler) Type() ServiceType       { return ServiceTypeIgnore }
-func (h UnimplementedHandler) OnInstall() error        { panic("Unimplemented OnInstall") }
-func (h UnimplementedHandler) OnStart() error          { panic("Unimplemented OnStart") }
-func (h UnimplementedHandler) OnStop() error           { panic("Unimplemented OnStop") }
+func (h UnimplementedHandler) OnInstall() error        { return errors.New("unimplemented OnInstall") }
+func (h UnimplementedHandler) OnStart() error          { return errors.New("unimplemented OnStart") }
+func (h UnimplementedHandler) OnStop() error           { return errors.New("unimplemented OnStop") }
 
 func (n *namespace) Name() string { return n.name }
-func (n *namespace) Set(key string, value any) {
+
+func (n *namespace) setValueWithLock(action func()) {
 	n.rw.Lock()
 	defer n.rw.Unlock()
-	n.values[key] = value
+	action()
+}
+
+func (n *namespace) Set(key string, value any) {
+	n.setValueWithLock(func() {
+		n.values[key] = value
+	})
 }
 
 func (n *namespace) Del(key string) {
-	n.rw.Lock()
-	defer n.rw.Unlock()
-	delete(n.values, key)
+	n.setValueWithLock(func() {
+		delete(n.values, key)
+	})
 }
 
 func (n *namespace) Get(key string) (any, bool) {
@@ -134,7 +147,7 @@ func newNamespace(name string) Namespace {
 	}
 	return &namespace{
 		name:       name,
-		values:     make(map[string]any),
+		values:     make(map[string]any, 16),
 		services:   make([]Service, 0, 8),
 		EnvManager: env,
 	}
@@ -142,14 +155,13 @@ func newNamespace(name string) Namespace {
 
 func (s unitSorter) Len() int { return len(s.units) }
 func (s unitSorter) Less(i, j int) bool {
-	if s.desc {
-		return s.units[i].Index > s.units[j].Index
-	}
-	return s.units[i].Index < s.units[j].Index
+	return (s.units[i].Index > s.units[j].Index) == s.desc
 }
 
 func (s unitSorter) Swap(i, j int) {
 	s.units[i], s.units[j] = s.units[j], s.units[i]
 }
 
-func (u Units) Sort(desc bool) { sort.Sort(unitSorter{units: u, desc: desc}) }
+func (u Units) Sort(desc bool) {
+	sort.Sort(unitSorter{units: u, desc: desc})
+}
