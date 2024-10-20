@@ -8,8 +8,8 @@ import (
 )
 
 type httpServer struct {
-	*packaged.UnimplementedHandler
-	ctx packaged.Namespace
+	*packaged.Unimplemented
+	ctx packaged.Group
 	svc *http.Server
 }
 
@@ -28,8 +28,8 @@ func (s httpServer) OnStop() error {
 }
 
 func main() {
-	packaged.Register(func(ns packaged.Namespace) packaged.Service {
-		return &httpServer{ctx: ns}
+	packaged.Register(func(g packaged.Group) packaged.Service {
+		return &httpServer{ctx: g}
 	})
 
 	if err := packaged.Run(); err != nil {

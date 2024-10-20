@@ -13,22 +13,22 @@ import (
 type Kit struct {
 	context.Context
 	cancelFunc context.CancelCauseFunc
-	namespaces map[string]Namespace
-	units      Units
+	Groups     map[string]Group
+	Entries    Units
 	stopOnce   sync.Once
 	Logger
 }
 
 func (k *Kit) stopServices() {
-	k.Warn("packaged: stop services.", "total_entries", len(k.units))
+	k.Warn("packaged: stop services.", "total_entries", len(k.Entries))
 
-	k.units.Sort(true)
+	k.Entries.Sort(true)
 
-	for _, unit := range k.units {
-		if err := unit.Entry.OnStop(); err != nil {
+	for _, entry := range k.Entries {
+		if err := entry.Entry.OnStop(); err != nil {
 			k.Logger.Error(
 				"packaged: failed to call on_stop.",
-				"entry_name", unit.Entry.Name(),
+				"entry_name", entry.Entry.Name(),
 				"cause", err.Error(),
 			)
 		}
@@ -43,9 +43,9 @@ func (k *Kit) runEntry(u *Unit) error {
 		k.Warn("packaged: ignoring service.", "name", u.Entry.Name())
 		return nil
 	case ServiceTypeBlocking:
-		return runBlocking(u.MaxRetry, u.RestartPolicy, u.Entry)
+		return runBlocking(u.MaxRetry, u.RetryDelay, u.RestartPolicy, u.Entry)
 	case ServiceTypeAsync:
-		runAsync(k.Context, u.MaxRetry, u.RestartPolicy, u.Entry, k.Logger)
+		runAsync(k.Context, u.MaxRetry, u.RetryDelay, u.RestartPolicy, u.Entry, k.Logger)
 		return nil
 	default:
 		k.Warn("packaged: unknown unit type, ignored.", "name", u.Entry.Name(), "type", u.Entry.Type())
@@ -53,21 +53,21 @@ func (k *Kit) runEntry(u *Unit) error {
 	}
 }
 
-func (k *Kit) Register(newFc NewService, opts ...UnitOptions) {
-	unit := &Unit{Namespace: PublicNamespace}
+func (k *Kit) Register(newEntry NewService, opts ...UnitOptions) {
+	entry := &Unit{GroupName: DefaultGroupName}
 	for _, opt := range opts {
-		opt(unit)
+		opt(entry)
 	}
 
-	ns, found := k.namespaces[unit.Namespace]
+	g, found := k.Groups[entry.GroupName]
 	if !found {
-		ns = newNamespace(unit.Namespace)
-		k.namespaces[unit.Namespace] = ns
+		g = newGroup(k.Context, entry.GroupName)
+		k.Groups[entry.GroupName] = g
 	}
 
-	unit.Entry = newFc(ns)
+	entry.Entry = newEntry(g)
 
-	k.units = append(k.units, unit)
+	k.Entries = append(k.Entries, entry)
 }
 
 func (k *Kit) Stop() {
@@ -79,20 +79,34 @@ func (k *Kit) Stop() {
 }
 
 func (k *Kit) Run() error {
-	if len(k.units) == 0 {
+	if len(k.Entries) == 0 {
 		k.Warn("packaged: no unit require run.")
 		return nil
 	}
 
-	k.units.Sort(false)
+	k.Entries.Sort(false)
 
-	k.Warn("packaged: run units.", "total_entries", len(k.units))
+	k.Warn("packaged: run Entries.", "total_entries", len(k.Entries))
 
-	for _, unit := range k.units {
-		if err := unit.Entry.OnInstall(); err != nil {
-			return fmt.Errorf("packaged: failed to call on_install. name: %s, reason: %s", unit.Entry.Name(), err)
+	setupEntries := make(map[int]struct{})
+	for i, entry := range k.Entries {
+		if err := entry.Entry.OnInstall(); err != nil {
+			return fmt.Errorf("packaged: failed to call on_install. name: %s, reason: %s", entry.Entry.Name(), err)
 		}
-		if err := k.runEntry(unit); err != nil {
+		if entry.Setup {
+			if err := k.runEntry(entry); err != nil {
+				return err
+			}
+			setupEntries[i] = struct{}{}
+		}
+	}
+
+	for i, entry := range k.Entries {
+		if _, found := setupEntries[i]; found {
+			// ignore setup unit
+			continue
+		}
+		if err := k.runEntry(entry); err != nil {
 			return err
 		}
 	}
@@ -113,9 +127,9 @@ func (k *Kit) Wait() {
 
 func New(opts ...KitOptions) *Kit {
 	kit := &Kit{
-		namespaces: make(map[string]Namespace),
-		units:      make(Units, 0, 32),
-		Logger:     slog.Default(),
+		Groups:  make(map[string]Group),
+		Entries: make(Units, 0, 32),
+		Logger:  slog.Default(),
 	}
 
 	for _, opt := range opts {

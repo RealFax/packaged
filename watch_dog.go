@@ -2,15 +2,17 @@ package packaged
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/syslog"
 	"os"
 	"runtime/debug"
+	"time"
 )
 
 var ServiceName string = "packaged-daemon"
 
-func restartRetry(retry int32, srv Service, logger Logger) (err error) {
+func restartRetry(retry int32, delay time.Duration, srv Service, logger Logger) (err error) {
 	for i := 0; i < int(retry); i++ {
 		if err = srv.OnStart(); err != nil {
 			if logger != nil {
@@ -20,12 +22,15 @@ func restartRetry(retry int32, srv Service, logger Logger) (err error) {
 					"retry", i,
 				)
 			}
+			if delay != 0 && retry > 1 {
+				time.Sleep(delay)
+			}
 		}
 	}
 	return err
 }
 
-func runBlocking(maxRetry int32, policy Restart, srv Service) (err error) {
+func runBlocking(maxRetry int32, delay time.Duration, policy Restart, srv Service) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			err = fmt.Errorf("panic recovered: %v\n%s", r, debug.Stack())
@@ -37,13 +42,15 @@ func runBlocking(maxRetry int32, policy Restart, srv Service) (err error) {
 	case RestartIgnore:
 		return srv.OnStart()
 	case RestartRetry:
-		return restartRetry(maxRetry, srv, nil)
+		return restartRetry(maxRetry, delay, srv, nil)
+	case RestartAlways:
+		return errors.New("restart always can not using in blocking mode")
 	default:
 		return nil
 	}
 }
 
-func runAsync(ctx context.Context, maxRetry int32, policy Restart, srv Service, logger Logger) {
+func runAsync(ctx context.Context, maxRetry int32, delay time.Duration, policy Restart, srv Service, logger Logger) {
 	switch policy {
 	case RestartIgnore:
 		go func() {
@@ -64,7 +71,7 @@ func runAsync(ctx context.Context, maxRetry int32, policy Restart, srv Service, 
 					logToJournalctl("CRITICAL", fmt.Sprintf("Panic in runAsync (RestartRetry): %v\n%s", r, debug.Stack()))
 				}
 			}()
-			restartRetry(maxRetry, srv, logger)
+			restartRetry(maxRetry, delay, srv, logger)
 		}()
 	case RestartAlways:
 		go func() {
@@ -86,6 +93,9 @@ func runAsync(ctx context.Context, maxRetry int32, policy Restart, srv Service, 
 							"reason", err,
 						)
 						logToJournalctl("ERROR", fmt.Sprintf("Failed to start service: %s, policy: %v, error: %v", srv.Name(), policy, err))
+						if delay != 0 {
+							time.Sleep(delay)
+						}
 					} else {
 						return
 					}

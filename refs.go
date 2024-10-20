@@ -3,14 +3,16 @@ package packaged
 import (
 	"context"
 	"errors"
+	"maps"
 	"sort"
 	"sync"
+	"time"
 )
 
 var (
-	_ Service        = &UnimplementedHandler{}
-	_ Namespace      = &namespace{}
-	_ sort.Interface = &unitSorter{}
+	_ Service        = &Unimplemented{}
+	_ Group          = &group{}
+	_ sort.Interface = &entriesSorter{}
 )
 
 type (
@@ -33,18 +35,23 @@ type (
 		OnStop() error
 	}
 
-	Namespace interface {
+	Group interface {
+		context.Context
 		Name() string
 		Set(key string, value any)
 		Del(key string)
 		Get(key string) (any, bool)
+		GetString(key string) (string, bool)
+		Values() map[string]any
 		Entries() []Service
 		EnvManager
 	}
 
 	Unit struct {
+		Setup           bool
 		Index, MaxRetry int32
-		Namespace       string
+		RetryDelay      time.Duration
+		GroupName       string
 		Description     string
 		Entry           Service
 		RestartPolicy   Restart
@@ -55,14 +62,15 @@ type (
 	Context struct {
 		context.Context
 		cancelFunc context.CancelCauseFunc
-		Namespace
+		Group
 
 		stopOnce sync.Once
 	}
 
-	UnimplementedHandler struct{}
+	Unimplemented struct{}
 
-	namespace struct {
+	group struct {
+		context.Context
 		name     string
 		rw       sync.RWMutex
 		values   map[string]any
@@ -70,9 +78,9 @@ type (
 		EnvManager
 	}
 
-	unitSorter struct {
-		units Units
-		desc  bool
+	entriesSorter struct {
+		entries Units
+		desc    bool
 	}
 )
 
@@ -80,7 +88,7 @@ var (
 	ErrQuitUnexpectedly = errors.New("quit unexpectedly")
 )
 
-const PublicNamespace = "__public_namespace__"
+const DefaultGroupName = "__group__"
 
 const (
 	ServiceTypeIgnore ServiceType = iota
@@ -94,41 +102,51 @@ const (
 	RestartRetry
 )
 
-func (h UnimplementedHandler) mustEmbedUnimplemented() {}
-func (h UnimplementedHandler) Name() string            { return "unimplemented" }
-func (h UnimplementedHandler) Type() ServiceType       { return ServiceTypeIgnore }
-func (h UnimplementedHandler) OnInstall() error        { return errors.New("unimplemented OnInstall") }
-func (h UnimplementedHandler) OnStart() error          { return errors.New("unimplemented OnStart") }
-func (h UnimplementedHandler) OnStop() error           { return errors.New("unimplemented OnStop") }
+func (h Unimplemented) mustEmbedUnimplemented() {}
+func (h Unimplemented) Name() string            { return "Unnamed-Service" }
+func (h Unimplemented) Type() ServiceType       { return ServiceTypeIgnore }
+func (h Unimplemented) OnInstall() error        { return nil }
+func (h Unimplemented) OnStart() error          { return errors.New("unimplemented OnStart") }
+func (h Unimplemented) OnStop() error           { return nil }
 
-func (n *namespace) Name() string { return n.name }
+func (n *group) Name() string { return n.name }
 
-func (n *namespace) setValueWithLock(action func()) {
+func (n *group) setValueWithLock(action func()) {
 	n.rw.Lock()
 	defer n.rw.Unlock()
 	action()
 }
 
-func (n *namespace) Set(key string, value any) {
+func (n *group) Set(key string, value any) {
 	n.setValueWithLock(func() {
 		n.values[key] = value
 	})
 }
 
-func (n *namespace) Del(key string) {
+func (n *group) Del(key string) {
 	n.setValueWithLock(func() {
 		delete(n.values, key)
 	})
 }
 
-func (n *namespace) Get(key string) (any, bool) {
+func (n *group) Get(key string) (any, bool) {
 	n.rw.RLock()
 	defer n.rw.RUnlock()
 	v, ok := n.values[key]
 	return v, ok
 }
 
-func (n *namespace) Entries() []Service {
+func (n *group) GetString(key string) (string, bool) {
+	return Assert[string](key, n)
+}
+
+func (n *group) Values() map[string]any {
+	n.rw.RLock()
+	defer n.rw.RUnlock()
+	return maps.Clone(n.values)
+}
+
+func (n *group) Entries() []Service {
 	return n.services
 }
 
@@ -138,14 +156,15 @@ func (c *Context) Stop() {
 	})
 }
 
-func newNamespace(name string) Namespace {
+func newGroup(ctx context.Context, name string) Group {
 	var env EnvManager
-	if name == PublicNamespace {
+	if name == DefaultGroupName {
 		env = lookupPrefix("")
 	} else {
 		env = lookupPrefix(name)
 	}
-	return &namespace{
+	return &group{
+		Context:    ctx,
 		name:       name,
 		values:     make(map[string]any, 16),
 		services:   make([]Service, 0, 8),
@@ -153,15 +172,27 @@ func newNamespace(name string) Namespace {
 	}
 }
 
-func (s unitSorter) Len() int { return len(s.units) }
-func (s unitSorter) Less(i, j int) bool {
-	return (s.units[i].Index > s.units[j].Index) == s.desc
+func (s entriesSorter) Len() int { return len(s.entries) }
+func (s entriesSorter) Less(i, j int) bool {
+	return (s.entries[i].Index > s.entries[j].Index) == s.desc
 }
 
-func (s unitSorter) Swap(i, j int) {
-	s.units[i], s.units[j] = s.units[j], s.units[i]
+func (s entriesSorter) Swap(i, j int) {
+	s.entries[i], s.entries[j] = s.entries[j], s.entries[i]
 }
 
 func (u Units) Sort(desc bool) {
-	sort.Sort(unitSorter{units: u, desc: desc})
+	fastForward := true
+	for _, unit := range u {
+		if unit.Index != 0 && fastForward {
+			fastForward = false
+		}
+	}
+
+	if fastForward {
+		// keep raw order
+		return
+	}
+
+	sort.Sort(entriesSorter{entries: u, desc: desc})
 }
